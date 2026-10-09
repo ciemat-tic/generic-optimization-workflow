@@ -15,7 +15,7 @@ from gow.candidate_ids import format_attempt_id, format_candidate_id, parse_cand
 from gow.config import load_problem_config
 from gow.layout import candidate_workdir, run_launchers_dir, run_root
 from gow.run import run_local_optimization
-from gow.postprocess import archive_generation_workdirs, finalize_generation, merge_runs
+from gow.postprocess import AsyncGenerationArchiver, archive_generation_workdirs, finalize_generation, finalize_run_launcher_tree, merge_runs, write_generation_launch_manifest
 
 app = typer.Typer(help="Generic Optimization Workflow (gow)")
 commands = typer.Typer(help="Commands")
@@ -210,6 +210,48 @@ def _is_better(a: float, b: float, direction: str) -> bool:
     raise ValueError("direction must be 'minimize' or 'maximize'")
 
 
+def _parse_group_size_option(value: Any) -> tuple[bool, int]:
+    """Return ``(auto_mode, fixed_size)`` for --group-size."""
+    if type(value).__name__ == "OptionInfo":
+        value = "0"
+    text = str(value).strip().lower()
+    if text == "auto":
+        return True, 0
+    try:
+        size = int(text)
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter("--group-size must be a non-negative integer or 'auto'") from exc
+    if size < 0:
+        raise typer.BadParameter("--group-size must be >= 0 or 'auto'")
+    return False, size
+
+
+def _representative_candidate(problem: Any) -> dict[str, Any]:
+    """Build a BSON-size-oriented representative candidate without running an optimizer."""
+    candidate: dict[str, Any] = {}
+    for name, param in problem.optimizable_parameters().items():
+        ptype = str(getattr(param, "type", ""))
+        if ptype == "categorical":
+            choices = list(getattr(param, "choices", None) or [])
+            if choices:
+                candidate[name] = max(choices, key=lambda x: len(str(x).encode("utf-8")))
+            else:
+                candidate[name] = getattr(param, "value", "")
+        elif ptype == "int":
+            bounds = list(getattr(param, "bounds", None) or [])
+            if bounds:
+                candidate[name] = max(bounds, key=lambda x: abs(int(x)))
+            else:
+                candidate[name] = int(getattr(param, "value", 0))
+        elif ptype == "real":
+            bounds = list(getattr(param, "bounds", None) or [])
+            if bounds:
+                candidate[name] = max(bounds, key=lambda x: abs(float(x)))
+            else:
+                candidate[name] = float(getattr(param, "value", 0.0))
+        else:
+            candidate[name] = getattr(param, "value", None)
+    return candidate
 
 
 def _launch_fireworks(
@@ -785,6 +827,115 @@ def fw_evaluate_cmd(
         typer.echo(f"Launch complete for current queue using launcher={launcher}.")
 
 
+@fw_app.command("group-size-preflight")
+def fw_group_size_preflight_cmd(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True, help="Path to optimization specs (YAML/JSON)."),
+    launchpad: Path | None = typer.Option(None, "--launchpad", help="Path to my_launchpad.yaml (FireWorks LaunchPad config)."),
+    outdir: Path | None = typer.Option(None, "--outdir", "-o", help="Results directory used to build the real FireWork payload."),
+    group_size: str = typer.Option("auto", "--group-size", help="Candidate group size to test, or 'auto'."),
+    njobs_queue: int = typer.Option(10, "--njobs-queue", min=1, help="Queue jobs to keep occupied when --group-size auto is used."),
+    bson_safety_fraction: float = typer.Option(0.75, "--bson-safety-fraction", min=0.05, max=1.0, help="Fraction of the MongoDB-reported BSON limit considered safe."),
+):
+    """Measure a representative batch FireWork against the connected MongoDB limits.
+
+    No Workflow is inserted. MongoDB capabilities are read from the actual FireWorks
+    LaunchPad connection using the ``hello`` command.
+    """
+    try:
+        from gow.fw.bson_preflight import (
+            htc_group_size_target,
+            largest_safe_group_size,
+            measure_workflow_bson,
+            query_mongo_server_limits,
+        )
+        from gow.fw.launchpad import load_launchpad
+        from gow.fw.workflow import BatchEvalSpec, SingleEvalSpec, build_batch_evaluate_workflow
+    except Exception as e:
+        raise typer.BadParameter(str(e)) from e
+
+    config_abs = config.expanduser().resolve()
+    results_dir = _resolve_results_dir(config_abs, outdir)
+    problem = load_problem_config(config_abs)
+    lp = load_launchpad(launchpad)
+    limits = query_mongo_server_limits(lp)
+    safe_bytes = limits.safe_document_limit(bson_safety_fraction)
+
+    auto_mode, fixed_size = _parse_group_size_option(group_size)
+    generation_size = min(problem.optimizer.batch_size, problem.optimizer.max_evaluations)
+    htc_target = htc_group_size_target(generation_size, njobs_queue)
+    requested_max = htc_target if auto_mode else (fixed_size or generation_size)
+    representative = _representative_candidate(problem)
+    run_id_val = "bson-preflight"
+    last_index = max(0, problem.optimizer.max_evaluations - 1)
+
+    def build_for_size(size: int):
+        items: list[SingleEvalSpec] = []
+        start_index = max(0, last_index - size + 1)
+        for offset in range(size):
+            idx = start_index + offset
+            cid = format_candidate_id(generation_id=0, candidate_index=idx, run_id=run_id_val)
+            items.append(
+                SingleEvalSpec(
+                    problem_config=config_abs,
+                    outdir=results_dir,
+                    run_id=run_id_val,
+                    candidate_id=cid,
+                    candidate_params=dict(representative),
+                    generation_id=0,
+                    candidate_index=idx,
+                    attempt_index=0,
+                )
+            )
+        return build_batch_evaluate_workflow(
+            BatchEvalSpec(
+                problem_config=config_abs,
+                outdir=results_dir,
+                run_id=run_id_val,
+                items=items,
+            )
+        )
+
+    safe_size, safe_measurement = largest_safe_group_size(
+        requested_max,
+        build_workflow_for_size=build_for_size,
+        safe_document_bytes=safe_bytes,
+    )
+
+    requested_measurement = measure_workflow_bson(build_for_size(requested_max)) if requested_max == safe_size else None
+
+    typer.echo("MongoDB-aware FireWork BSON preflight")
+    typer.echo(f"maxBsonObjectSize:    {limits.max_bson_object_size / (1024 * 1024):.2f} MiB")
+    typer.echo(f"maxMessageSizeBytes:  {limits.max_message_size_bytes / (1024 * 1024):.2f} MiB")
+    typer.echo(f"maxWriteBatchSize:    {limits.max_write_batch_size}")
+    typer.echo(f"safety fraction:      {bson_safety_fraction:.3f}")
+    typer.echo(f"safe document limit:  {safe_bytes / (1024 * 1024):.2f} MiB")
+    typer.echo(f"generation candidates:{generation_size:>10}")
+    typer.echo(f"njobs_queue:          {njobs_queue:>10}")
+    typer.echo(f"HTC group target:     {htc_target:>10}")
+    typer.echo(f"requested maximum:    {requested_max:>10}")
+    typer.echo(f"BSON-safe maximum:    {safe_size:>10}")
+
+    if safe_measurement is not None:
+        typer.echo(f"BSON at safe maximum: {safe_measurement.max_document_mib:.2f} MiB")
+
+    if safe_size <= 0:
+        raise typer.BadParameter("Even one candidate exceeds the configured safe MongoDB BSON threshold.")
+
+    if auto_mode:
+        selected = min(htc_target, safe_size)
+        typer.echo(f"AUTO selected:        {selected:>10}")
+        typer.echo(f"FireWorks/generation: {(generation_size + selected - 1) // selected:>10}")
+    elif safe_size < requested_max:
+        typer.echo(f"UNSAFE: --group-size {requested_max} exceeds the server-aware safety threshold.")
+        typer.echo(f"Recommended maximum for this representative payload: {safe_size}")
+        raise typer.Exit(code=2)
+    else:
+        measurement = requested_measurement or safe_measurement
+        if measurement is not None:
+            typer.echo(f"Requested BSON size:  {measurement.max_document_mib:.2f} MiB")
+        typer.echo("Status: OK")
+
+
 @fw_app.command("run")
 def fw_run_cmd(
     config: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True, help="Path to optimization specs (YAML/JSON)."),
@@ -815,11 +966,17 @@ def fw_run_cmd(
     ),
     njobs_queue: int = typer.Option(10, "--njobs-queue", min=0, help="Max queued jobs for FireWorks queue rapidfire."),
     reserve: bool = typer.Option(False, "--reserve/--no-reserve", help="Reserve jobs before launching when using queue rapidfire."),
-    group_size: int = typer.Option(
-        0,
+    group_size: str = typer.Option(
+        "0",
         "--group-size",
-        min=0,
-        help="Number of candidates per FireWork. 0 means use optimizer batch_size.",
+        help="Number of candidates per FireWork, 0 for the whole batch, or 'auto' for MongoDB/HTC-aware sizing.",
+    ),
+    bson_safety_fraction: float = typer.Option(
+        0.75,
+        "--bson-safety-fraction",
+        min=0.05,
+        max=1.0,
+        help="Fraction of MongoDB hello.maxBsonObjectSize used as the safe FireWork document threshold.",
     ),
     queue_wait: bool = typer.Option(True, "--queue-wait/--no-queue-wait", help="Wait for queue-launched batches to finish before tell()."),
     queue_poll_seconds: int = typer.Option(10, "--queue-poll-seconds", min=1, help="Polling interval in seconds while waiting for queue batches."),
@@ -827,6 +984,8 @@ def fw_run_cmd(
     max_missing_result_retries: int = typer.Option(2, "--max-missing-result-retries", min=0, help="How many times to resubmit candidates missing result.json after terminal queue states."),
     archive_generations: bool = typer.Option(False, "--archive-generations/--no-archive-generations", help="Archive each completed generation into a single tar.gz."),
     delete_archived_workdirs: bool = typer.Option(False, "--delete-archived-workdirs/--keep-archived-workdirs", help="Delete candidate workdirs after successfully archiving a generation."),
+    delete_archived_launchers: bool = typer.Option(True, "--delete-archived-launchers/--keep-archived-launchers", help="Delete terminal leaf launcher directories after they are safely archived."),
+    archive_backlog: int = typer.Option(3, "--archive-backlog", min=1, help="Maximum completed generations queued for the single background archiver."),
 ):
     """
     Submit AND (optionally) launch a full optimization loop using FireWorks.
@@ -834,6 +993,12 @@ def fw_run_cmd(
     NOTE: This is a simple synchronous loop (submit batch -> launch -> read results -> tell).
     """
     try:
+        from gow.fw.bson_preflight import (
+            htc_group_size_target,
+            largest_safe_prefix_size,
+            measure_workflow_bson,
+            query_mongo_server_limits,
+        )
         from gow.fw.launchpad import load_launchpad
         from gow.fw.tasks import append_run_result_record, rebuild_problem_results_jsonl, rebuild_run_results_jsonl, verify_run_results_complete
         from gow.fw.workflow import BatchEvalSpec, SingleEvalSpec, build_batch_evaluate_workflow
@@ -844,11 +1009,16 @@ def fw_run_cmd(
     config_abs = config.expanduser().resolve()
     results_dir = _resolve_results_dir(config_abs, outdir)
 
+    if type(bson_safety_fraction).__name__ == "OptionInfo":
+        bson_safety_fraction = 0.75
     archive_generations = _coerce_bool_option(archive_generations, False)
     delete_archived_workdirs = _coerce_bool_option(delete_archived_workdirs, False)
 
     problem = load_problem_config(config_abs)
     lp = load_launchpad(launchpad)
+    mongo_limits = query_mongo_server_limits(lp)
+    safe_bson_bytes = mongo_limits.safe_document_limit(bson_safety_fraction)
+    auto_group_size, fixed_group_size = _parse_group_size_option(group_size)
 
     run_id_val = run_id or _default_run_id()
     launchers_dir = launch_dir.expanduser().resolve() if launch_dir else run_launchers_dir(results_dir, run_id_val)
@@ -880,6 +1050,13 @@ def fw_run_cmd(
     if str(launcher).strip().lower() == "queue":
         typer.echo(f"qadapter: {qadapter or 'auto'}")
         typer.echo(f"njobs_queue: {njobs_queue}")
+    typer.echo(
+        "MongoDB BSON limits: "
+        f"maxBsonObjectSize={mongo_limits.max_bson_object_size / (1024 * 1024):.2f} MiB, "
+        f"maxMessageSizeBytes={mongo_limits.max_message_size_bytes / (1024 * 1024):.2f} MiB, "
+        f"safety={bson_safety_fraction:.3f} -> {safe_bson_bytes / (1024 * 1024):.2f} MiB"
+    )
+    typer.echo(f"group_size: {'auto' if auto_group_size else (fixed_group_size or 'batch_size')}")
     typer.echo(f"max_evaluations={opt_cfg.max_evaluations}  batch_size={opt_cfg.batch_size}")
 
     def _read_candidate_record(workdir: Path) -> dict[str, Any] | None:
@@ -898,11 +1075,23 @@ def fw_run_cmd(
 
     best_obj: float | None = None
     best_info: dict[str, Any] | None = None
+    archiver = (
+        AsyncGenerationArchiver(
+            outdir=results_dir,
+            run_id=run_id_val,
+            delete_candidate_workdirs=delete_archived_workdirs,
+            delete_launcher_dirs=delete_archived_launchers,
+            max_pending=archive_backlog,
+        )
+        if archive_generations
+        else None
+    )
 
     n_done = 0
     while n_done < opt_cfg.max_evaluations:
         n_batch = min(opt_cfg.batch_size, opt_cfg.max_evaluations - n_done)
         generation_id = n_done // opt_cfg.batch_size
+        generation_fw_ids: set[int] = set()
 
         candidates = optimizer.ask(problem, n_batch)
 
@@ -930,31 +1119,125 @@ def fw_run_cmd(
                 )
             )
 
-        effective_group_size = group_size or n_batch
         specs_by_candidate_id = {spec.candidate_id: spec for spec in specs}
         pending_specs = list(specs)
         retry_counts: dict[str, int] = {spec.candidate_id: 0 for spec in specs}
+        # Once BSON constrains a generation, keep the discovered cap for its retries.
+        generation_bson_cap: int | None = None
+
+        def _build_batch_wf(items: list[SingleEvalSpec]):
+            return build_batch_evaluate_workflow(
+                BatchEvalSpec(
+                    problem_config=config_abs,
+                    outdir=results_dir,
+                    run_id=run_id_val,
+                    items=items,
+                )
+            )
 
         while pending_specs:
+            is_queue_launcher = str(launcher).strip().lower() == "queue"
+            htc_target = (
+                htc_group_size_target(len(pending_specs), njobs_queue)
+                if auto_group_size and is_queue_launcher
+                else len(pending_specs)
+            )
+            requested_group_size = (
+                min(htc_target, generation_bson_cap)
+                if auto_group_size and generation_bson_cap is not None
+                else htc_target
+                if auto_group_size
+                else (fixed_group_size or len(pending_specs))
+            )
+            requested_group_size = max(1, min(requested_group_size, len(pending_specs)))
+
+            # Plan the complete submission wave before inserting any Workflow.  This
+            # prevents a fixed --group-size from partially submitting a generation
+            # before a later, larger candidate payload is discovered to be unsafe.
+            planned_chunk_sizes: list[int] = []
+            planned_max_bson = 0
+            cursor = 0
+            while cursor < len(pending_specs):
+                requested = min(requested_group_size, len(pending_specs) - cursor)
+                remaining_specs = pending_specs[cursor:]
+                chunk = remaining_specs[:requested]
+                wf = _build_batch_wf(chunk)
+                measurement = measure_workflow_bson(wf)
+
+                if measurement.max_document_bytes > safe_bson_bytes:
+                    safe_size, safe_measurement = largest_safe_prefix_size(
+                        remaining_specs,
+                        requested,
+                        build_workflow=lambda prefix: _build_batch_wf(list(prefix)),
+                        safe_document_bytes=safe_bson_bytes,
+                    )
+                    if safe_size <= 0:
+                        raise RuntimeError(
+                            "MongoDB BSON preflight failed: even one candidate produces a FireWorks "
+                            f"document larger than the safe limit of {safe_bson_bytes / (1024 * 1024):.2f} MiB."
+                        )
+                    if not auto_group_size:
+                        raise typer.BadParameter(
+                            f"--group-size {requested} is unsafe for this generation: largest FireWorks "
+                            f"document is {measurement.max_document_mib:.2f} MiB, while the server-aware "
+                            f"safe limit is {safe_bson_bytes / (1024 * 1024):.2f} MiB. "
+                            f"Use --group-size {safe_size} or smaller, or use --group-size auto."
+                        )
+                    requested = safe_size
+                    generation_bson_cap = (
+                        safe_size
+                        if generation_bson_cap is None
+                        else min(generation_bson_cap, safe_size)
+                    )
+                    measurement = safe_measurement or measure_workflow_bson(
+                        _build_batch_wf(remaining_specs[:requested])
+                    )
+                    requested_group_size = min(requested_group_size, requested)
+
+                planned_chunk_sizes.append(requested)
+                planned_max_bson = max(planned_max_bson, measurement.max_document_bytes)
+                cursor += requested
+
+            if auto_group_size:
+                typer.echo(
+                    "AUTO group-size plan: "
+                    f"pending={len(pending_specs)}, njobs_queue={njobs_queue if is_queue_launcher else 0}, "
+                    f"HTC target={htc_target}, BSON cap={generation_bson_cap or 'not limiting'}, "
+                    f"groups={len(planned_chunk_sizes)}, sizes={min(planned_chunk_sizes)}..{max(planned_chunk_sizes)}, "
+                    f"max BSON={planned_max_bson / (1024 * 1024):.2f} MiB"
+                )
+            else:
+                typer.echo(
+                    "BSON preflight OK: "
+                    f"group_size={requested_group_size}, groups={len(planned_chunk_sizes)}, "
+                    f"max BSON={planned_max_bson / (1024 * 1024):.2f} MiB"
+                )
+
             submitted_fw_ids: list[int] = []
             submitted_candidate_ids: list[str] = []
-            for start in range(0, len(pending_specs), effective_group_size):
-                chunk = pending_specs[start : start + effective_group_size]
-                wf = build_batch_evaluate_workflow(
-                    BatchEvalSpec(
-                        problem_config=config_abs,
-                        outdir=results_dir,
-                        run_id=run_id_val,
-                        items=chunk,
+            cursor = 0
+            for chunk_size in planned_chunk_sizes:
+                chunk = pending_specs[cursor : cursor + chunk_size]
+                wf = _build_batch_wf(chunk)
+                # Re-measure immediately before add_wf().  This is deliberately
+                # redundant with planning: no oversized document reaches PyMongo.
+                measurement = measure_workflow_bson(wf)
+                if measurement.max_document_bytes > safe_bson_bytes:
+                    raise RuntimeError(
+                        "FireWork BSON payload changed after preflight and now exceeds the "
+                        f"server-aware safe limit ({measurement.max_document_mib:.2f} MiB > "
+                        f"{safe_bson_bytes / (1024 * 1024):.2f} MiB). Nothing further was submitted."
                     )
-                )
                 id_map = lp.add_wf(wf)
-                submitted_fw_ids.extend(_extract_fw_ids(id_map))
+                new_fw_ids = _extract_fw_ids(id_map)
+                submitted_fw_ids.extend(new_fw_ids)
+                generation_fw_ids.update(new_fw_ids)
                 submitted_candidate_ids.extend([item.candidate_id for item in chunk])
+                cursor += chunk_size
 
             typer.echo(
                 f"Submitted batch of {len(submitted_candidate_ids)} candidate(s) in "
-                f"{(len(pending_specs) + effective_group_size - 1) // effective_group_size} FireWork group(s)."
+                f"{len(planned_chunk_sizes)} FireWork group(s)."
             )
 
             if launch:
@@ -1082,16 +1365,31 @@ def fw_run_cmd(
             completed_generations=(n_done + n_batch + opt_cfg.batch_size - 1) // opt_cfg.batch_size,
             final=(n_done + n_batch) >= opt_cfg.max_evaluations,
         )
-        if archive_generations:
-            archive_generation_workdirs(
-                outdir=results_dir,
-                run_id=run_id_val,
+        launch_manifest = write_generation_launch_manifest(
+            outdir=results_dir,
+            run_id=run_id_val,
+            generation_id=generation_id,
+            fw_ids=sorted(generation_fw_ids),
+            lp=lp,
+        )
+        if archiver is not None:
+            archiver.submit(
                 generation_id=generation_id,
                 candidate_ids=candidate_ids,
-                delete_source=delete_archived_workdirs,
+                launch_manifest=launch_manifest,
             )
 
         n_done += n_batch
+
+    if archiver is not None:
+        archiver.close()
+        if delete_archived_launchers:
+            finalize_run_launcher_tree(
+                outdir=results_dir,
+                run_id=run_id_val,
+                lp=lp,
+                delete_source=True,
+            )
 
     ok_run, actual_run = verify_run_results_complete(results_dir, run_id_val, opt_cfg.max_evaluations)
     if not ok_run:

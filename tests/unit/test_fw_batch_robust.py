@@ -6,7 +6,7 @@ from pathlib import Path
 import yaml
 
 from gow.candidate_ids import format_candidate_id
-from gow.fw.tasks import AppendBatchResultsTask, EvaluateBatchTask, rebuild_problem_results_jsonl, rebuild_run_results_jsonl
+from gow.fw.tasks import EvaluateBatchTask, rebuild_problem_results_jsonl, rebuild_run_results_jsonl
 
 
 def _write_yaml(path: Path, data: dict) -> None:
@@ -116,9 +116,6 @@ def test_evaluate_batch_task_continues_after_single_candidate_exception(tmp_path
 
     items = [
         {
-            "problem_config": str(config_yaml.resolve()),
-            "outdir": str(outdir.resolve()),
-            "run_id": run_id,
             "candidate_id": candidate_ok,
             "candidate_params": {"x": 0.1},
             "generation_id": 0,
@@ -126,9 +123,6 @@ def test_evaluate_batch_task_continues_after_single_candidate_exception(tmp_path
             "attempt_index": 0,
         },
         {
-            "problem_config": str(config_yaml.resolve()),
-            "outdir": str(outdir.resolve()),
-            "run_id": run_id,
             "candidate_id": candidate_fail,
             "candidate_params": {"x": 0.2},
             "generation_id": 0,
@@ -137,40 +131,24 @@ def test_evaluate_batch_task_continues_after_single_candidate_exception(tmp_path
         },
     ]
 
-    action = EvaluateBatchTask({"items": items}).run_task({})
-    records = list(action.stored_data["batch_results"])
+    action = EvaluateBatchTask(
+        {
+            "problem_config": str(config_yaml.resolve()),
+            "outdir": str(outdir.resolve()),
+            "run_id": run_id,
+            "items": items,
+        }
+    ).run_task({})
+    assert action.stored_data == {"evaluated": 2, "failed": 1}
+    assert action.update_spec == {}
 
-    assert [r["candidate_id"] for r in records] == [candidate_ok, candidate_fail]
-
-    ok = records[0]
-    failed = records[1]
-
-    assert ok["fitness"]["status"] == "ok"
-    assert ok["failure_kind"] is None
-
-    assert failed["fitness"]["status"] == "failed"
-    assert failed["fitness"]["failure_kind"] == "internal_error"
-    assert failed["failure_kind"] == "internal_error"
-    assert "boom for batch candidate" in failed["fitness"]["error"]
-    assert failed["candidate_index"] == 1
-    assert failed["attempt_index"] == 0
-
+    ok = json.loads((outdir / "runs" / run_id / candidate_ok / "result.json").read_text(encoding="utf-8"))
     failed_result_path = outdir / "runs" / run_id / candidate_fail / "result.json"
     assert failed_result_path.exists()
     failed_payload = json.loads(failed_result_path.read_text(encoding="utf-8"))
     assert failed_payload["candidate_id"] == candidate_fail
     assert failed_payload["fitness"]["status"] == "failed"
     assert failed_payload["failure_kind"] == "internal_error"
-
-    append_action = AppendBatchResultsTask(
-        {
-            "outdir": str(outdir.resolve()),
-            "problem_id": "toy-fw-batch-robust",
-            "run_id": run_id,
-        }
-    ).run_task({"batch_results": records})
-
-    assert append_action.stored_data["run_results"].endswith("results.jsonl")
 
     assert not (outdir / "results.jsonl").exists()
     assert not (outdir / "runs" / run_id / "results.jsonl").exists()

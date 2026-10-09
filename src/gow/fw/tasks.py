@@ -197,19 +197,23 @@ class EvaluateCandidateTask(FiretaskBase):
 
 @explicit_serialize
 class EvaluateBatchTask(FiretaskBase):
-    """
-    Evaluate multiple candidates sequentially inside a single FireWork.
-    Each candidate still keeps its own workdir and result.json.
+    """Evaluate multiple candidates sequentially inside one slim FireWork.
 
-    Robust mode: a failure in one candidate is converted into a failed record
-    so the rest of the batch can continue executing.
+    Shared paths/configuration live once on the task. Candidate-specific items only
+    contain candidate_id, params and metadata. Every result remains persisted in the
+    candidate workdir; MongoDB only receives small aggregate counters.
     """
-    required_params = ["items"]
+    required_params = ["problem_config", "outdir", "run_id", "items"]
 
-    def _failed_record_from_exception(self, item: Dict[str, Any], exc: Exception) -> Dict[str, Any]:
-        problem_config = Path(item["problem_config"]).expanduser().resolve()
-        outdir = Path(item["outdir"]).expanduser().resolve()
-        run_id = str(item["run_id"])
+    def _failed_record_from_exception(
+        self,
+        item: Dict[str, Any],
+        exc: Exception,
+        *,
+        problem_config: Path,
+        outdir: Path,
+        run_id: str,
+    ) -> Dict[str, Any]:
         candidate_id = str(item["candidate_id"])
         candidate_params = dict(item.get("candidate_params", {}))
         generation_id = item.get("generation_id")
@@ -236,8 +240,6 @@ class EvaluateBatchTask(FiretaskBase):
             problem_id = problem.id
             runtime_params = problem.runtime_params()
         except Exception:
-            # If even the config cannot be loaded, preserve the candidate record
-            # without aborting the whole batch.
             pass
 
         fitness = {
@@ -249,7 +251,6 @@ class EvaluateBatchTask(FiretaskBase):
             "error": f"Unhandled batch exception: {exc}",
             "failure_kind": "internal_error",
         }
-
         record: Dict[str, Any] = {
             "problem_id": problem_id,
             "run_id": run_id,
@@ -273,21 +274,24 @@ class EvaluateBatchTask(FiretaskBase):
             "input_path": str(workdir / "input.json"),
             "output_path": str(workdir / "output.json"),
         }
-
         (workdir / "result.json").write_text(
-            json.dumps(record, indent=2, sort_keys=True),
-            encoding="utf-8",
+            json.dumps(record, indent=2, sort_keys=True), encoding="utf-8"
         )
         return record
 
     def run_task(self, fw_spec: Dict[str, Any]) -> FWAction:
-        records: list[Dict[str, Any]] = []
+        problem_config = Path(self["problem_config"]).expanduser().resolve()
+        outdir = Path(self["outdir"]).expanduser().resolve()
+        run_id = str(self["run_id"])
+        evaluated = 0
+        failed = 0
+
         for item in self["items"]:
             try:
                 record = _evaluate_one_candidate(
-                    problem_config=Path(item["problem_config"]).expanduser().resolve(),
-                    outdir=Path(item["outdir"]).expanduser().resolve(),
-                    run_id=str(item["run_id"]),
+                    problem_config=problem_config,
+                    outdir=outdir,
+                    run_id=run_id,
                     candidate_id=str(item["candidate_id"]),
                     candidate_params=dict(item["candidate_params"]),
                     context_override=item.get("context_override"),
@@ -296,13 +300,16 @@ class EvaluateBatchTask(FiretaskBase):
                     attempt_index=int(item.get("attempt_index", 0)),
                 )
             except Exception as exc:
-                record = self._failed_record_from_exception(item, exc)
-            records.append(record)
+                record = self._failed_record_from_exception(
+                    item, exc, problem_config=problem_config, outdir=outdir, run_id=run_id
+                )
+            evaluated += 1
+            if record.get("failure_kind") is not None or (record.get("fitness") or {}).get("status") != "ok":
+                failed += 1
 
-        return FWAction(
-            stored_data={"batch_results": records},
-            update_spec={"batch_results": records},
-        )
+        # Deliberately do not update fw_spec with per-candidate results. Each record
+        # already exists as result.json and is consolidated by the generation pipeline.
+        return FWAction(stored_data={"evaluated": evaluated, "failed": failed})
 
 
 def _iter_jsonl_records(path: Path) -> Iterable[Dict[str, Any]]:
@@ -642,68 +649,6 @@ class AppendResultJsonlTask(FiretaskBase):
                 "problem_id": problem_id,
                 "run_results": str(run_results_path),
                 "appended_run": None,
-                "deferred_run_rebuild": True,
-            }
-        )
-
-
-@explicit_serialize
-class AppendBatchResultsTask(AppendResultJsonlTask):
-    """
-    Append a batch of already evaluated candidate records to the canonical jsonl files.
-    """
-    required_params = ["outdir", "problem_id", "run_id"]
-    optional_params = [
-        "results_filename",
-        "lock_filename",
-        "skip_if_exists",
-        "append_run_level",
-    ]
-
-    def run_task(self, fw_spec: Dict[str, Any]) -> FWAction:
-        records = list(fw_spec.get("batch_results") or [])
-
-        outdir = Path(self["outdir"]).expanduser().resolve()
-        problem_id: str = self["problem_id"]
-        run_id: str = self["run_id"]
-
-        results_filename = str(self.get("results_filename", "results.jsonl"))
-
-        outdir.mkdir(parents=True, exist_ok=True)
-        run_dir = run_root_dir(outdir, run_id)
-        run_dir.mkdir(parents=True, exist_ok=True)
-
-        run_results_path = run_dir / results_filename
-
-        appended_summary = []
-        for record in records:
-            rec_pid = record.get("problem_id")
-            if rec_pid and str(rec_pid) != str(problem_id):
-                raise RuntimeError(
-                    f"Record problem_id={rec_pid!r} does not match task problem_id={problem_id!r}"
-                )
-
-            rec_rid = record.get("run_id")
-            if rec_rid is not None and str(rec_rid) != str(run_id):
-                raise RuntimeError(
-                    f"Record run_id={rec_rid!r} does not match task run_id={run_id!r}"
-                )
-
-            candidate_id = str(record["candidate_id"])
-            attempt_id = str(record.get("attempt_id")) if record.get("attempt_id") is not None else None
-            appended_summary.append(
-                {
-                    "candidate_id": candidate_id,
-                    "attempt_id": attempt_id,
-                    "appended_run": None,
-                }
-            )
-
-        return FWAction(
-            stored_data={
-                "batch_append": appended_summary,
-                "problem_id": problem_id,
-                "run_results": str(run_results_path),
                 "deferred_run_rebuild": True,
             }
         )

@@ -21,7 +21,6 @@ _ensure_fireworks_imports()
 from fireworks import Firework, Workflow  # type: ignore  # noqa: E402
 
 from .tasks import (  # noqa: E402
-    AppendBatchResultsTask,
     AppendResultJsonlTask,
     EvaluateBatchTask,
     EvaluateCandidateTask,
@@ -56,11 +55,13 @@ class BatchEvalSpec:
     items: list[SingleEvalSpec]
 
 
-def _single_item_payload(spec: SingleEvalSpec) -> Dict[str, Any]:
+def _batch_item_payload(spec: SingleEvalSpec) -> Dict[str, Any]:
+    """Serialize only candidate-specific batch fields.
+
+    problem_config, outdir and run_id are shared by the whole FireWork and are
+    intentionally kept out of every item to keep FireWorks/Mongo documents small.
+    """
     payload: Dict[str, Any] = {
-        "problem_config": str(Path(spec.problem_config).expanduser().resolve()),
-        "outdir": str(Path(spec.outdir).expanduser().resolve()),
-        "run_id": spec.run_id,
         "candidate_id": spec.candidate_id,
         "candidate_params": _to_jsonable(spec.candidate_params),
         "generation_id": spec.generation_id,
@@ -131,36 +132,36 @@ def build_single_evaluate_workflow(spec: SingleEvalSpec) -> Workflow:
 
 
 def build_batch_evaluate_workflow(spec: BatchEvalSpec) -> Workflow:
-    """
-    Workflow (single FireWork, two Firetasks) for a batch of candidates:
-      1) EvaluateBatchTask -> writes one result.json per candidate workdir
-      2) AppendBatchResultsTask -> appends all records to runs/<run_id>/results.jsonl
+    """Build one slim FireWork for a batch of candidates.
 
-    The problem-level <outdir>/results.jsonl is rebuilt after the run completes.
+    EvaluateBatchTask persists one result.json per candidate. No result payload is
+    copied back into the FireWork spec and there is no append task: generation
+    consolidation is performed later by the coordinator from those result files.
     """
     problem_config_abs = Path(spec.problem_config).expanduser().resolve()
     outdir_abs = Path(spec.outdir).expanduser().resolve()
 
     problem = load_problem_config(problem_config_abs)
-    items_payload = [_single_item_payload(item) for item in spec.items]
-    candidate_ids = [item.candidate_id for item in spec.items]
+    items_payload = [_batch_item_payload(item) for item in spec.items]
+    generation_ids = {item.generation_id for item in spec.items}
+    generation_id = next(iter(generation_ids)) if len(generation_ids) == 1 else None
 
     fw = Firework(
         [
-            EvaluateBatchTask({"items": items_payload}),
-            AppendBatchResultsTask(
+            EvaluateBatchTask(
                 {
+                    "problem_config": str(problem_config_abs),
                     "outdir": str(outdir_abs),
-                    "problem_id": problem.id,
                     "run_id": spec.run_id,
+                    "items": items_payload,
                 }
             ),
         ],
-        name=f"evaluate+append-batch:{problem.id}:{spec.run_id}:n{len(spec.items)}",
+        name=f"evaluate-batch:{problem.id}:{spec.run_id}:n{len(spec.items)}",
         spec={
             "problem_id": problem.id,
             "run_id": spec.run_id,
-            "candidate_ids": candidate_ids,
+            "generation_id": generation_id,
             "batch_size": len(spec.items),
         },
     )

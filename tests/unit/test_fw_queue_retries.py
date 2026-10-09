@@ -44,9 +44,24 @@ class _FakeOptimizer:
         self.tell_calls.append((list(candidates), list(fitness_dicts)))
 
 
+class _FakeMongoAdmin:
+    def command(self, name: str):
+        assert name == "hello"
+        return {
+            "maxBsonObjectSize": 16 * 1024 * 1024,
+            "maxMessageSizeBytes": 48_000_000,
+            "maxWriteBatchSize": 100_000,
+        }
+
+
+class _FakeMongoClient:
+    admin = _FakeMongoAdmin()
+
+
 class _FakeLP:
     def __init__(self):
         self.next_id = 100
+        self.connection = _FakeMongoClient()
 
     def add_wf(self, wf):
         self.next_id += 1
@@ -103,9 +118,15 @@ def test_fw_run_cmd_retries_missing_queue_candidates_then_rebuilds_global(
         lambda *args, **kwargs: (False, list(kwargs.get("candidate_ids", args[3] if len(args) > 3 else []))),
     )
 
+    class _FakeWorkflow:
+        fws = []
+
+        def to_db_dict(self):
+            return {"name": "fake-workflow"}
+
     def fake_build_batch(spec):
         submitted_attempt_indexes.append([item.attempt_index for item in spec.items])
-        return {"wf": True}
+        return _FakeWorkflow()
 
     monkeypatch.setattr("gow.fw.workflow.build_batch_evaluate_workflow", fake_build_batch)
 
